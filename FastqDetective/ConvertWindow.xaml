@@ -1,0 +1,29 @@
+﻿<Window x:Class="FastqDetective.ConvertWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:FastqDetective"
+        mc:Ignorable="d"
+        ResizeMode="CanMinimize"
+        Title="Fastq Detective - Fastq to FASTA" Height="180" Width="650">
+    <Grid Margin="10">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="400" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Label Grid.Row="0" Margin="0 5 0 5">Input File (Fastq):</Label>
+        <TextBox Grid.Row="0" Margin="0 5 0 5" Grid.Column="1" Name="InputPath" />
+
+        <Label Grid.Row="1" Margin="0 5 0 5">Output File (FASTA):</Label>
+        <TextBox Grid.Row="1" Grid.Column="1" Margin="0 5 0 5" Name="OutputPath" />
+
+        <Button Grid.Row="2" Grid.Column="3" Margin="10" Name="StartButton" Click="StartButton_Click" Height="20" Width="60" VerticalAlignment="Bottom">Convert</Button>
+    </Grid>
+</Window>
