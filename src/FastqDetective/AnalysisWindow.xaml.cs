@@ -25,8 +25,8 @@ namespace FastqDetective
         public AnalysisWindow()
         {
             InitializeComponent();
-            SequencePath.Text = @"E:\Downloads\NG-24273_F17P9_lib382784_6668_7_1.fastq";
-            MarkerPath.Text = @"E:\Downloads\a.txt";
+            SequencePath.Text = @"C:\Examplepath\XX-YYYYY_XYYXYY_libYYYYYY_YYYY_Y_Y.fastq";
+            MarkerPath.Text = @"C:\Examplepath\marker.txt";
         }
 
         private void StartButton_Click(object sender, RoutedEventArgs e)
@@ -64,7 +64,7 @@ namespace FastqDetective
 
             var markers = MarkerParser.ParseFile(markerPath);
             var chunk = Math.Max(markers.Max(m => m.Length) * 3, chunkSize);
-            var concurrentMax = Math.Max(128, maxChunks);
+            var concurrentMax = Math.Max(64, maxChunks);
             var slidingStepRemainder = (int)((3 - threshold * 2) * markers.Max(m => m.Length) - 1);
 
             ChunkSize.Text = chunk.ToString();
