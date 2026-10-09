@@ -9,6 +9,12 @@ namespace FastqDetective.Parsing
 {
     public static class AnalysisParser
     {
+        private const int HeaderLineStep = 0;
+        private const int SequenceLineStep = 1;
+        private const int SeparatorLineStep = 2;
+        private const int QualityLineStep = 3;
+        private const int TaskPollIntervalMilliseconds = 10;
+
         public static void ParseFile(
             string path,
             int fromIndex,
@@ -45,18 +51,18 @@ namespace FastqDetective.Parsing
                             {
                                 switch (context.ParseStep)
                                 {
-                                    case 0:
+                                    case HeaderLineStep:
                                         ++context.ParseStep;
                                         break;
-                                    case 1:
+                                    case SequenceLineStep:
                                         ++context.ParseStep;
                                         context.CurrentSequence = currentLine.ToLowerInvariant();
                                         context.CurrentSequenceIndex += currentLine.Length;
                                         break;
-                                    case 2:
+                                    case SeparatorLineStep:
                                         ++context.ParseStep;
                                         break;
-                                    case 3:
+                                    case QualityLineStep:
                                         context.CurrentCertaintySequence = currentLine.ToLowerInvariant();
                                         context.ParseStep = 0;
                                         break;
@@ -68,17 +74,17 @@ namespace FastqDetective.Parsing
 
                             switch (context.ParseStep)
                             {
-                                case 0:
+                                case HeaderLineStep:
                                     ++context.ParseStep;
                                     break;
-                                case 1:
+                                case SequenceLineStep:
                                     ++context.ParseStep;
                                     context.CurrentSequence += currentLine.ToLowerInvariant();
                                     break;
-                                case 2:
+                                case SeparatorLineStep:
                                     ++context.ParseStep;
                                     break;
-                                case 3:
+                                case QualityLineStep:
                                     context.CurrentCertaintySequence += currentLine.ToLowerInvariant();
 
                                     // Keep sequence and quality buffers aligned. If malformed FASTQ
@@ -86,24 +92,13 @@ namespace FastqDetective.Parsing
                                     while (context.CurrentSequence.Length >= chunkSize &&
                                            context.CurrentCertaintySequence.Length >= chunkSize)
                                     {
-                                        var sequenceBytes = Encoding.ASCII.GetBytes(
-                                            context.CurrentSequence.Substring(0, chunkSize));
-                                        var certaintyBytes = Encoding.ASCII.GetBytes(
-                                            context.CurrentCertaintySequence.Substring(0, chunkSize));
-                                        var chunkStartIndex = context.CurrentSequenceIndex;
-                                        var threshold = context.Threshold;
-
-                                        foreach (var parsingResult in context.parsingResults)
-                                        {
-                                            ScheduleLocus(
-                                                parsingResult,
-                                                sequenceBytes,
-                                                certaintyBytes,
-                                                threshold,
-                                                chunkStartIndex,
-                                                concurrencyGate,
-                                                context);
-                                        }
+                                        ScheduleChunk(
+                                            context.CurrentSequence,
+                                            context.CurrentCertaintySequence,
+                                            chunkSize,
+                                            context.CurrentSequenceIndex,
+                                            context,
+                                            concurrencyGate);
 
                                         context.CurrentSequence = context.CurrentSequence.Substring(slidingStep);
                                         context.CurrentCertaintySequence =
@@ -130,31 +125,20 @@ namespace FastqDetective.Parsing
                             var sharedLength = Math.Min(
                                 context.CurrentSequence.Length,
                                 context.CurrentCertaintySequence.Length);
-                            var sequenceBytes = Encoding.ASCII.GetBytes(
-                                context.CurrentSequence.Substring(0, sharedLength));
-                            var certaintyBytes = Encoding.ASCII.GetBytes(
-                                context.CurrentCertaintySequence.Substring(0, sharedLength));
-                            var chunkStartIndex = context.CurrentSequenceIndex;
-                            var threshold = context.Threshold;
-
-                            foreach (var parsingResult in context.parsingResults)
-                            {
-                                ScheduleLocus(
-                                    parsingResult,
-                                    sequenceBytes,
-                                    certaintyBytes,
-                                    threshold,
-                                    chunkStartIndex,
-                                    concurrencyGate,
-                                    context);
-                            }
+                            ScheduleChunk(
+                                context.CurrentSequence,
+                                context.CurrentCertaintySequence,
+                                sharedLength,
+                                context.CurrentSequenceIndex,
+                                context,
+                                concurrencyGate);
                         }
                     }
 
                     while (context.parsingResults.SelectMany(r => r.ActiveTasks).Any(t => !t.IsCompleted))
                     {
                         UpdateTaskState(context);
-                        Thread.Sleep(10);
+                        Thread.Sleep(TaskPollIntervalMilliseconds);
                     }
 
                     UpdateTaskState(context);
@@ -166,6 +150,39 @@ namespace FastqDetective.Parsing
                     throw;
                 }
             }
+        }
+
+        private static void ScheduleChunk(
+            string sequence,
+            string certaintySequence,
+            int length,
+            long chunkStartIndex,
+            ParsingContext context,
+            SemaphoreSlim concurrencyGate)
+        {
+            // Convert only the selected prefix; avoid allocating temporary Substring values.
+            var sequenceBytes = GetAsciiBytes(sequence, length);
+            var certaintyBytes = GetAsciiBytes(certaintySequence, length);
+            var threshold = context.Threshold;
+
+            foreach (var parsingResult in context.parsingResults)
+            {
+                ScheduleLocus(
+                    parsingResult,
+                    sequenceBytes,
+                    certaintyBytes,
+                    threshold,
+                    chunkStartIndex,
+                    concurrencyGate,
+                    context);
+            }
+        }
+
+        private static byte[] GetAsciiBytes(string value, int length)
+        {
+            var bytes = new byte[length];
+            Encoding.ASCII.GetBytes(value, 0, length, bytes, 0);
+            return bytes;
         }
 
         private static void ScheduleLocus(
@@ -238,15 +255,20 @@ namespace FastqDetective.Parsing
                 return null;
 
             var value = score.Value;
-            var normalizedScore = (double)value.Score / (2 * marker.Length);
+            var normalizedScore = (double)value.Score / (MatchScore * marker.Length);
             var sequence = Encoding.ASCII.GetString(currentSequenceBytes);
-            var length = value.EndPosition - value.StartPosition;
 
             return new MarkerMatch(
                 (sequenceIndex + value.StartPosition).ToString(),
                 normalizedScore,
-                sequence.Substring(value.StartPosition, length));
+                sequence);
         }
+
+        private const int MatchScore = 2;
+        private const int MismatchScore = -1;
+        private const int GapOpenPenalty = 2;
+        private const int GapExtensionPenalty = 1;
+        private const int NegativeInfinity = int.MinValue / 4;
 
         private struct ScoreContext
         {
@@ -267,7 +289,8 @@ namespace FastqDetective.Parsing
         /// Match = +2, mismatch = -1, gap-open = -2, gap-extension = -1.
         /// The zero floor permits a local alignment to restart at any cell.
         ///
-        /// Conservative upper-bound pruning is enabled below. The legacy heuristic and
+        /// Conservative upper-bound pruning stops when no continuation or new local alignment
+        /// can strictly improve the first maximum already found. The legacy heuristic and
         /// diagSkip cell skipping remain disabled until their correctness is proven.
         /// </summary>
         private static ScoreContext? RegionalSmithWaterman(
@@ -280,15 +303,9 @@ namespace FastqDetective.Parsing
             if (marker.Length == 0 || sequence.Length == 0)
                 return null;
 
-            const int matchScore = 2;
-            const int mismatchScore = -1;
-            const int gapOpenPenalty = 2;
-            const int gapExtensionPenalty = 1;
-            const int NegativeInfinity = int.MinValue / 4;
-
             int markerLength = marker.Length;
             int sequenceLength = sequence.Length;
-            double absoluteThreshold = threshold * 2 * markerLength;
+            double absoluteThreshold = threshold * MatchScore * markerLength;
 
             // H is the best local score. E/F track gaps in the two directions.
             var previousH = new int[markerLength + 1];
@@ -306,29 +323,6 @@ namespace FastqDetective.Parsing
 
             for (int i = 1; i <= sequenceLength; i++)
             {
-                // Conservative potential bound for any alignment that starts in the UNPROCESSED
-                // suffix. With a zero-reset recurrence, a future local alignment can restart at
-                // any row; therefore "current row score + remaining matches" alone is NOT a
-                // valid global bound. The maximum score from the remaining suffix is at most
-                // +2 per paired character, with at most min(markerLength, remaining rows) pairs.
-                int remainingSequenceLength = sequenceLength - i + 1;
-                int maximumPotentialInRemainingSuffix =
-                    matchScore * Math.Min(markerLength, remainingSequenceLength);
-                int bestPossibleOverallScore =
-                    Math.Max(globalMaxScore, maximumPotentialInRemainingSuffix);
-
-                // Safe threshold pruning: if neither the best score already seen nor any possible
-                // alignment in the remaining suffix can reach threshold, the task cannot return a
-                // match. TODO: validate threshold units/semantics against UI and legacy outputs.
-                if (bestPossibleOverallScore < absoluteThreshold)
-                    break;
-
-                // Safe best-score pruning: if no alignment in the unprocessed suffix can beat the
-                // current best, further rows cannot change the returned score. Strict '<' preserves
-                // current tie behavior (the first maximum wins).
-                if (maximumPotentialInRemainingSuffix < globalMaxScore)
-                    break;
-
                 currentH[0] = 0;
                 currentOrigin[0] = i;
                 gapInSequence[0] = NegativeInfinity;
@@ -339,16 +333,16 @@ namespace FastqDetective.Parsing
                 for (int j = 1; j <= markerLength; j++)
                 {
                     currentGapInMarker[j] = Math.Max(
-                        previousH[j] - gapOpenPenalty,
-                        previousGapInMarker[j] - gapExtensionPenalty);
+                        previousH[j] - GapOpenPenalty,
+                        previousGapInMarker[j] - GapExtensionPenalty);
 
                     gapInSequence[j] = Math.Max(
-                        currentH[j - 1] - gapOpenPenalty,
-                        gapInSequence[j - 1] - gapExtensionPenalty);
+                        currentH[j - 1] - GapOpenPenalty,
+                        gapInSequence[j - 1] - GapExtensionPenalty);
 
                     int substitution = marker[j - 1] == sequence[i - 1]
-                        ? matchScore
-                        : mismatchScore;
+                        ? MatchScore
+                        : MismatchScore;
                     int diagonal = previousH[j - 1] + substitution;
 
                     // Canonical Smith-Waterman local-alignment reset.
@@ -387,14 +381,37 @@ namespace FastqDetective.Parsing
                         rowMaxScore = best;
                 }
 
-                // TODO (shared-state safety): keep all pruning inputs local to this invocation.
-                // Do not read context.Threshold, context.CurrentSequenceIndex, or a mutable
-                // "best score so far" shared across Tasks here unless protected/snapshotted.
-                // Every task must prune only against its own marker/chunk and captured threshold.
-                //
-                // Potential pruning note: rowMaxScore is useful for diagnostics/experiments, but
-                // it is deliberately NOT used as the sole bound. With Smith-Waterman zero-reset,
-                // a later row may start a completely new local alignment.
+                // Bound both alignments already in progress (including the vertical gap state)
+                // and any new local alignment that could start in the unprocessed suffix.
+                // Every future sequence character can add at most MatchScore to an active
+                // alignment. A fresh local alignment is bounded by a perfect match over the
+                // shorter of the remaining sequence and marker. Use long arithmetic to avoid
+                // overflow in the bounds for unusually large inputs.
+                int remaining = sequenceLength - i;
+                long activePotential = 0;
+                for (int j = 1; j <= markerLength; j++)
+                {
+                    // At column j, at most markerLength-j additional marker characters
+                    // can contribute positive substitutions to this alignment.
+                    int additionalMatches = Math.Min(remaining, markerLength - j);
+                    long statePotential = (long)currentH[j] +
+                        (long)MatchScore * additionalMatches;
+                    if (statePotential > activePotential)
+                        activePotential = statePotential;
+
+                    statePotential = (long)currentGapInMarker[j] +
+                        (long)MatchScore * additionalMatches;
+                    if (statePotential > activePotential)
+                        activePotential = statePotential;
+                }
+
+                long newAlignmentPotential = (long)MatchScore * Math.Min(markerLength, remaining);
+                long potential = Math.Max(activePotential, newAlignmentPotential);
+
+                // Equal scores need not replace the first maximum already recorded.
+                if (globalMaxScore > 0 && potential <= globalMaxScore)
+                    break;
+
                 Swap(ref previousH, ref currentH);
                 Swap(ref previousOrigin, ref currentOrigin);
                 Swap(ref previousGapInMarker, ref currentGapInMarker);
