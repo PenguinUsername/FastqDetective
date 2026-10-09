@@ -32,7 +32,7 @@ Independent marker/chunk search tasks can be scheduled concurrently. Rolling arr
 
 ## Requirements
 
-The project has ooooold origins. It's a C# Windows Presentation Foundation (WPF) application targeting .NET Core 3.0. A compatible Windows development environment and .NET SDK are needed to build it. Because this target framework is old, check the project's build requirements and runtime compatibility in your environment before deployment.
+The project has ooooold origins, but target framework was refreshed. It's a C# Windows Presentation Foundation (WPF) application targeting .NET 10.0. A compatible Windows development environment and .NET SDK are needed to build it.
 
 ## Input data
 
