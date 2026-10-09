@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use FastqDetective, please cite this software."
+title: "FastqDetective"
+type: software
+authors:
+  - family-names: Ericsson
+    given-names: Hampus
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/YOUR-USERNAME/FastqDetective"

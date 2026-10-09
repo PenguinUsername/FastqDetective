@@ -9,142 +9,199 @@ namespace FastqDetective.Parsing
 {
     public static class AnalysisParser
     {
-        public static void ParseFile(string path, int fromIndex, int toIndex, int chunkSize, int slidingStepRemainder, int concurrentMax, ParsingContext context, CancellationTokenSource cancellationTokenSource)
+        public static void ParseFile(
+            string path,
+            int fromIndex,
+            int toIndex,
+            int chunkSize,
+            int slidingStepRemainder,
+            int concurrentMax,
+            ParsingContext context,
+            CancellationTokenSource cancellationTokenSource)
         {
-            try
+            if (context == null) throw new ArgumentNullException(nameof(context));
+            if (cancellationTokenSource == null) throw new ArgumentNullException(nameof(cancellationTokenSource));
+            if (chunkSize <= 0) throw new ArgumentOutOfRangeException(nameof(chunkSize));
+
+            concurrentMax = Math.Max(1, concurrentMax);
+            var slidingStep = chunkSize - slidingStepRemainder;
+            if (slidingStep <= 0 || slidingStep > chunkSize)
+                throw new ArgumentOutOfRangeException(nameof(slidingStepRemainder),
+                    "The resulting sliding step must be between 1 and chunkSize.");
+
+            using (var concurrencyGate = new SemaphoreSlim(concurrentMax, concurrentMax))
             {
-                using (StreamReader sr = new StreamReader(path))
+                try
                 {
-                    string currentLine;
-
-                    bool skip = context.CurrentSequenceIndex < fromIndex;
-
-                    bool diagSkip = false;
-
-                    while ((currentLine = sr.ReadLine()) != null && !cancellationTokenSource.IsCancellationRequested)
+                    using (var sr = new StreamReader(path))
                     {
-                        if (skip)
+                        string currentLine;
+                        bool skip = context.CurrentSequenceIndex < fromIndex;
+
+                        while ((currentLine = sr.ReadLine()) != null &&
+                               !cancellationTokenSource.IsCancellationRequested)
                         {
+                            if (skip)
+                            {
+                                switch (context.ParseStep)
+                                {
+                                    case 0:
+                                        ++context.ParseStep;
+                                        break;
+                                    case 1:
+                                        ++context.ParseStep;
+                                        context.CurrentSequence = currentLine.ToLowerInvariant();
+                                        context.CurrentSequenceIndex += currentLine.Length;
+                                        break;
+                                    case 2:
+                                        ++context.ParseStep;
+                                        break;
+                                    case 3:
+                                        context.CurrentCertaintySequence = currentLine.ToLowerInvariant();
+                                        context.ParseStep = 0;
+                                        break;
+                                }
+
+                                skip = context.CurrentSequenceIndex < fromIndex || context.ParseStep != 0;
+                                continue;
+                            }
+
                             switch (context.ParseStep)
                             {
                                 case 0:
-
                                     ++context.ParseStep;
                                     break;
                                 case 1:
                                     ++context.ParseStep;
-                                    context.CurrentSequence = currentLine.ToLower();
-                                    context.CurrentSequenceIndex += currentLine.Length;
+                                    context.CurrentSequence += currentLine.ToLowerInvariant();
                                     break;
                                 case 2:
                                     ++context.ParseStep;
                                     break;
                                 case 3:
-                                    context.CurrentCertaintySequence = currentLine.ToLower();
+                                    context.CurrentCertaintySequence += currentLine.ToLowerInvariant();
+
+                                    // Keep sequence and quality buffers aligned. If malformed FASTQ
+                                    // records provide different line lengths, process only their shared prefix.
+                                    while (context.CurrentSequence.Length >= chunkSize &&
+                                           context.CurrentCertaintySequence.Length >= chunkSize)
+                                    {
+                                        var sequenceBytes = Encoding.ASCII.GetBytes(
+                                            context.CurrentSequence.Substring(0, chunkSize));
+                                        var certaintyBytes = Encoding.ASCII.GetBytes(
+                                            context.CurrentCertaintySequence.Substring(0, chunkSize));
+                                        var chunkStartIndex = context.CurrentSequenceIndex;
+                                        var threshold = context.Threshold;
+
+                                        foreach (var parsingResult in context.parsingResults)
+                                        {
+                                            ScheduleLocus(
+                                                parsingResult,
+                                                sequenceBytes,
+                                                certaintyBytes,
+                                                threshold,
+                                                chunkStartIndex,
+                                                concurrencyGate,
+                                                context);
+                                        }
+
+                                        context.CurrentSequence = context.CurrentSequence.Substring(slidingStep);
+                                        context.CurrentCertaintySequence =
+                                            context.CurrentCertaintySequence.Substring(slidingStep);
+                                        context.CurrentSequenceIndex += slidingStep;
+                                    }
+
                                     context.ParseStep = 0;
-                                    break;
-                                default:
                                     break;
                             }
 
-                            skip = context.CurrentSequenceIndex < fromIndex || context.ParseStep != 0;
+                            UpdateTaskState(context);
 
-                            continue;
-                        }
-
-                        switch (context.ParseStep)
-                        {
-                            case 0:
-                                //var values = currentLine.Split(' ');
-                                //var leftValues = currentLine.Split(':');
-                                //var rightValues = currentLine.Split(':');
-
-                                //context.InstrumentName = leftValues[0];
-                                //context.RunId = leftValues[1];
-                                //context.FlowcellId = leftValues[2];
-                                //context.FlowcellLane = leftValues[3];
-                                //context.ClusterCoordinateX = leftValues[4];
-                                //context.ClusterCoordinateY = leftValues[5];
-
-                                //context.IndexSequence = rightValues[3];
-
-                                ++context.ParseStep;
-                                break;
-                            case 1:
-                                ++context.ParseStep;
-                                context.CurrentSequence += currentLine.ToLower();
-                                break;
-                            case 2:
-                                ++context.ParseStep;
-                                break;
-                            case 3:
-                                context.CurrentCertaintySequence += currentLine.ToLower();
-
-                                if (context.CurrentSequence.Length >= chunkSize) // while if single byte slide
-                                {
-                                    var slidingStep = chunkSize - slidingStepRemainder;
-
-                                    var currentSequenceBytes = Encoding.ASCII.GetBytes(context.CurrentSequence.Substring(0, chunkSize));
-                                    var currentCertaintyBytes = Encoding.ASCII.GetBytes(context.CurrentCertaintySequence.Substring(0, chunkSize));
-
-                                    foreach (var parsingResult in context.parsingResults)
-                                    {
-                                        var newTask = Task.Run(() => EvaluateLocus(parsingResult.Marker, currentSequenceBytes, currentCertaintyBytes, context.Threshold, context.CurrentSequenceIndex, diagSkip));
-                                        parsingResult.ActiveTasks.Add(newTask);
-                                        diagSkip = true;
-                                        Interlocked.Increment(ref context.TasksStarted);
-                                    }
-
-                                    context.CurrentSequence = context.CurrentSequence.Substring(slidingStep);
-                                    context.CurrentCertaintySequence = context.CurrentCertaintySequence.Substring(slidingStep);
-                                    context.CurrentSequenceIndex += slidingStep;
-
-                                    Interlocked.Exchange(ref context.CurrentSequenceIndex, context.CurrentSequenceIndex);
-                                }
-
-                                context.ParseStep = 0;
-                                break;
-                            default:
+                            if (toIndex > 0 && context.CurrentSequenceIndex >= toIndex)
                                 break;
                         }
 
-                        if (context.parsingResults.Sum(res => res.ActiveTasks.Count) >= concurrentMax)
+                        // On normal EOF, evaluate the remaining partial chunk. If cancellation was
+                        // requested, do not enqueue new work; already-started tasks are still drained below.
+                        if (!cancellationTokenSource.IsCancellationRequested &&
+                            context.CurrentSequence.Length > 0 &&
+                            context.CurrentCertaintySequence.Length > 0)
                         {
-                            Thread.Sleep(1000);
-                        }
+                            var sharedLength = Math.Min(
+                                context.CurrentSequence.Length,
+                                context.CurrentCertaintySequence.Length);
+                            var sequenceBytes = Encoding.ASCII.GetBytes(
+                                context.CurrentSequence.Substring(0, sharedLength));
+                            var certaintyBytes = Encoding.ASCII.GetBytes(
+                                context.CurrentCertaintySequence.Substring(0, sharedLength));
+                            var chunkStartIndex = context.CurrentSequenceIndex;
+                            var threshold = context.Threshold;
 
-                        UpdateTaskState(context);
-
-                        if (toIndex > 0 && context.CurrentSequenceIndex >= toIndex)
-                        {
-                            break;
+                            foreach (var parsingResult in context.parsingResults)
+                            {
+                                ScheduleLocus(
+                                    parsingResult,
+                                    sequenceBytes,
+                                    certaintyBytes,
+                                    threshold,
+                                    chunkStartIndex,
+                                    concurrencyGate,
+                                    context);
+                            }
                         }
                     }
 
-                    foreach (var parsingResult in context.parsingResults)
-                    {
-                        var currentSequenceBytes = Encoding.ASCII.GetBytes(context.CurrentSequence);
-                        var currentCertaintyBytes = Encoding.ASCII.GetBytes(context.CurrentCertaintySequence);
-
-                        var newTask = EvaluateLocus(parsingResult.Marker, currentSequenceBytes, currentCertaintyBytes, context.Threshold, context.CurrentSequenceIndex, false);
-                        parsingResult.ActiveTasks.Add(newTask);
-                        Interlocked.Increment(ref context.TasksStarted);
-                    }
-
-                    Interlocked.Exchange(ref context.CurrentSequenceIndex, context.CurrentSequenceIndex);
-
-                    while (context.parsingResults.SelectMany(res => res.ActiveTasks).Any(t => !t.IsCompleted))
+                    while (context.parsingResults.SelectMany(r => r.ActiveTasks).Any(t => !t.IsCompleted))
                     {
                         UpdateTaskState(context);
-                        Thread.Sleep(500);
+                        Thread.Sleep(10);
                     }
+
+                    UpdateTaskState(context);
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine("The file could not be read or analyzed:");
+                    Console.WriteLine(e);
+                    throw;
                 }
             }
-            catch (Exception e)
+        }
+
+        private static void ScheduleLocus(
+            ParsingResult parsingResult,
+            byte[] sequenceBytes,
+            byte[] certaintyBytes,
+            double threshold,
+            long sequenceIndex,
+            SemaphoreSlim concurrencyGate,
+            ParsingContext context)
+        {
+            // Wait before scheduling so the number of running calculations is bounded.
+            concurrencyGate.Wait();
+
+            // All per-task inputs are captured as arguments, not read later from mutable parser state.
+            // TODO: Marker is a byte[] property; verify it is immutable after scheduling. If markers
+            // can be edited/replaced in place, clone it here before the Task.Run delegate captures it.
+            var task = Task.Run(() =>
             {
-                Console.WriteLine("The file could not be read:");
-                Console.WriteLine(e.Message);
-            }
+                try
+                {
+                    return EvaluateLocus(
+                        parsingResult.Marker,
+                        sequenceBytes,
+                        certaintyBytes,
+                        threshold,
+                        sequenceIndex);
+                }
+                finally
+                {
+                    concurrencyGate.Release();
+                }
+            });
+
+            parsingResult.ActiveTasks.Add(task);
+            Interlocked.Increment(ref context.TasksStarted);
         }
 
         private static void UpdateTaskState(ParsingContext context)
@@ -155,12 +212,10 @@ namespace FastqDetective.Parsing
 
                 foreach (var task in completedTasks)
                 {
-                    var result = task.Result;
-
+                    // Observe faults rather than silently treating failed work as a missing match.
+                    var result = task.GetAwaiter().GetResult();
                     if (result != null)
-                    {
                         parsingResult.Matches.Add(result);
-                    }
 
                     Interlocked.Increment(ref context.TasksResultsReceived);
                     parsingResult.ActiveTasks.Remove(task);
@@ -168,23 +223,29 @@ namespace FastqDetective.Parsing
             }
         }
 
-        private static async Task<MarkerMatch> EvaluateLocus(byte[] marker, byte[] currentSequenceBytes, byte[] currentCertaintyBytes, double threshold, long sequenceIndex, bool diagSkip)
+        private static MarkerMatch EvaluateLocus(
+            byte[] marker,
+            byte[] currentSequenceBytes,
+            byte[] currentCertaintyBytes,
+            double threshold,
+            long sequenceIndex)
         {
-            var score = RegionalSmithWaterman(marker, currentSequenceBytes, threshold, diagSkip);
+            // Quality/certainty bytes are retained in the signature for compatibility with callers,
+            // but the original scoring model does not use them.
+            var score = RegionalSmithWaterman(marker, currentSequenceBytes, threshold);
 
-            if (score != null)
-            {
-                var normalizedScore = (double)score.Value.Score / (2 * marker.Length);
-
-                var match = new MarkerMatch((sequenceIndex + score.Value.StartPosition).ToString(), 
-                    normalizedScore, 
-                    Encoding.ASCII.GetString(currentSequenceBytes).Substring(score.Value.StartPosition, score.Value.EndPosition - score.Value.StartPosition));
-                return match;
-            }
-            else
-            {
+            if (!score.HasValue)
                 return null;
-            }
+
+            var value = score.Value;
+            var normalizedScore = (double)value.Score / (2 * marker.Length);
+            var sequence = Encoding.ASCII.GetString(currentSequenceBytes);
+            var length = value.EndPosition - value.StartPosition;
+
+            return new MarkerMatch(
+                (sequenceIndex + value.StartPosition).ToString(),
+                normalizedScore,
+                sequence.Substring(value.StartPosition, length));
         }
 
         private struct ScoreContext
@@ -201,177 +262,157 @@ namespace FastqDetective.Parsing
             }
         }
 
-        private static ScoreContext? RegionalSmithWaterman(byte[] marker, byte[] sequence, double threshold, bool diagSkip)
+        /// <summary>
+        /// Smith-Waterman local alignment with affine gaps and rolling arrays.
+        /// Match = +2, mismatch = -1, gap-open = -2, gap-extension = -1.
+        /// The zero floor permits a local alignment to restart at any cell.
+        ///
+        /// Conservative upper-bound pruning is enabled below. The legacy heuristic and
+        /// diagSkip cell skipping remain disabled until their correctness is proven.
+        /// </summary>
+        private static ScoreContext? RegionalSmithWaterman(
+            byte[] marker,
+            byte[] sequence,
+            double threshold)
         {
+            if (marker == null) throw new ArgumentNullException(nameof(marker));
+            if (sequence == null) throw new ArgumentNullException(nameof(sequence));
+            if (marker.Length == 0 || sequence.Length == 0)
+                return null;
+
+            const int matchScore = 2;
+            const int mismatchScore = -1;
+            const int gapOpenPenalty = 2;
+            const int gapExtensionPenalty = 1;
+            const int NegativeInfinity = int.MinValue / 4;
+
+            int markerLength = marker.Length;
+            int sequenceLength = sequence.Length;
+            double absoluteThreshold = threshold * 2 * markerLength;
+
+            // H is the best local score. E/F track gaps in the two directions.
+            var previousH = new int[markerLength + 1];
+            var currentH = new int[markerLength + 1];
+            var previousOrigin = new int[markerLength + 1];
+            var currentOrigin = new int[markerLength + 1];
+
+            var previousGapInMarker = Enumerable.Repeat(NegativeInfinity, markerLength + 1).ToArray();
+            var currentGapInMarker = new int[markerLength + 1];
+            var gapInSequence = new int[markerLength + 1];
+
             int globalMaxScore = 0;
             int globalMaxOrigin = 0;
             int globalMaxEnd = 0;
 
-            int markerCount = marker.Length + 1;
-            int sequenceCount = sequence.Length + 1;
-
-            var sequenceDiff = sequenceCount - markerCount;
-
-            var absoluteThreshold = threshold * 2 * marker.Length;
-
-            int[] previousScoreColumn = new int[markerCount];
-            int[] currentScoreColumn = new int[markerCount];
-            int[] previousOriginColumn = new int[markerCount];
-            int[] currentOriginColumn = new int[markerCount];
-
-            for (int j = 0; j < markerCount; j++)
+            for (int i = 1; i <= sequenceLength; i++)
             {
-                currentOriginColumn[j] = 1;
-            }
+                // Conservative potential bound for any alignment that starts in the UNPROCESSED
+                // suffix. With a zero-reset recurrence, a future local alignment can restart at
+                // any row; therefore "current row score + remaining matches" alone is NOT a
+                // valid global bound. The maximum score from the remaining suffix is at most
+                // +2 per paired character, with at most min(markerLength, remaining rows) pairs.
+                int remainingSequenceLength = sequenceLength - i + 1;
+                int maximumPotentialInRemainingSuffix =
+                    matchScore * Math.Min(markerLength, remainingSequenceLength);
+                int bestPossibleOverallScore =
+                    Math.Max(globalMaxScore, maximumPotentialInRemainingSuffix);
 
-            var deadIndexes = new bool[markerCount];
-            deadIndexes[0] = true;
+                // Safe threshold pruning: if neither the best score already seen nor any possible
+                // alignment in the remaining suffix can reach threshold, the task cannot return a
+                // match. TODO: validate threshold units/semantics against UI and legacy outputs.
+                if (bestPossibleOverallScore < absoluteThreshold)
+                    break;
 
-            var previousFromLeft = new bool[markerCount];
+                // Safe best-score pruning: if no alignment in the unprocessed suffix can beat the
+                // current best, further rows cannot change the returned score. Strict '<' preserves
+                // current tie behavior (the first maximum wins).
+                if (maximumPotentialInRemainingSuffix < globalMaxScore)
+                    break;
 
-            var globalPotential = markerCount * 2;
+                currentH[0] = 0;
+                currentOrigin[0] = i;
+                gapInSequence[0] = NegativeInfinity;
+                currentGapInMarker[0] = NegativeInfinity;
 
-            //Matrix Fill Step
-            for (int i = 1; i < sequenceCount; i++)
-            {
-                var rowMaxPotential = 0;
-                var columnPotential = Math.Min((sequenceCount - i) * 2, globalPotential);
+                int rowMaxScore = 0;
 
-                var previousWasUp = false;
-
-                currentScoreColumn[0] = 0;
-                currentOriginColumn[0] = i;
-
-                for (int j = 1; j < markerCount; j++)
+                for (int j = 1; j <= markerLength; j++)
                 {
-                    if(diagSkip)
-                    {
-                        if (i < markerCount && j > i )
-                        {
-                            deadIndexes[j] = false;
-                            continue;
-                        }
+                    currentGapInMarker[j] = Math.Max(
+                        previousH[j] - gapOpenPenalty,
+                        previousGapInMarker[j] - gapExtensionPenalty);
 
-                        if (i > sequenceDiff && j < i - sequenceDiff)
-                        {
-                            deadIndexes[j] = false;
-                            continue;
-                        }
+                    gapInSequence[j] = Math.Max(
+                        currentH[j - 1] - gapOpenPenalty,
+                        gapInSequence[j - 1] - gapExtensionPenalty);
+
+                    int substitution = marker[j - 1] == sequence[i - 1]
+                        ? matchScore
+                        : mismatchScore;
+                    int diagonal = previousH[j - 1] + substitution;
+
+                    // Canonical Smith-Waterman local-alignment reset.
+                    int best = Math.Max(0, Math.Max(diagonal,
+                        Math.Max(currentGapInMarker[j], gapInSequence[j])));
+
+                    if (best == 0)
+                    {
+                        currentOrigin[j] = i;
                     }
-
-                    if (deadIndexes[j])
+                    else if (best == diagonal)
                     {
-                        currentScoreColumn[j] = currentScoreColumn[j - 1] - 2;
-                        currentOriginColumn[j] = currentOriginColumn[j - 1];
-                        deadIndexes[j] = false;
-                        continue;
+                        currentOrigin[j] = previousH[j - 1] == 0
+                            ? i - 1
+                            : previousOrigin[j - 1];
                     }
-
-                    int scoreDiag;
-                    if (marker[j - 1] == sequence[i - 1])
-                        scoreDiag = previousScoreColumn[j - 1] + 2;
-                    else
-                        scoreDiag = previousScoreColumn[j - 1] - 1;
-
-                    int scoreUp;
-                    int scoreLeft;
-
-                    if (previousWasUp)
+                    else if (best == currentGapInMarker[j])
                     {
-                        scoreUp = currentScoreColumn[j - 1] - 1;
-                    } else
-                    {
-                        scoreUp = currentScoreColumn[j - 1] - 2;
-                    }
-
-                    if (previousFromLeft[j])
-                    {
-                        scoreLeft = previousScoreColumn[j] - 1;
+                        currentOrigin[j] = previousOrigin[j];
                     }
                     else
                     {
-                        scoreLeft = previousScoreColumn[j] - 2;
+                        currentOrigin[j] = currentOrigin[j - 1];
                     }
 
-                    int localMax = Math.Max(Math.Max(scoreDiag, scoreLeft), scoreUp);
-                    int origin = 0;
+                    currentH[j] = best;
 
-                    if (scoreUp == localMax)
+                    if (best > globalMaxScore)
                     {
-                        origin = currentOriginColumn[j - 1];
-                        previousWasUp = true;
-                    } else
-                    {
-                        previousWasUp = false;
-                    }
-
-                    if (scoreLeft == localMax)
-                    {
-                        origin = previousOriginColumn[j];
-                        previousFromLeft[j] = true;
-                    }
-                    else
-                    {
-                        previousFromLeft[j] = false;
-                    }
-
-                    if (scoreDiag == localMax)
-                    {
-                        origin = previousOriginColumn[j - 1];
-                    }
-
-                    if (localMax <= 0)
-                    {
-                        origin = i - 1;
-                    }
-
-                    currentOriginColumn[j] = origin;
-
-                    if (localMax > globalMaxScore)
-                    {
-                        globalMaxScore = localMax;
-                        globalMaxOrigin = origin;
+                        globalMaxScore = best;
+                        globalMaxOrigin = currentOrigin[j];
                         globalMaxEnd = i;
                     }
 
-                    var localPotential = localMax + Math.Min((markerCount - j) * 2, columnPotential);
-
-                    if (localPotential > rowMaxPotential) {
-                        rowMaxPotential = localPotential;
-                    }
-
-                    currentScoreColumn[j] = localMax;
-
-                    deadIndexes[j] = localPotential < absoluteThreshold && deadIndexes[j - 1];
+                    if (best > rowMaxScore)
+                        rowMaxScore = best;
                 }
 
-                if (rowMaxPotential < Math.Max(absoluteThreshold, globalMaxScore))
-                {
-                    break;
-                }
-
-                var tempBubble = previousScoreColumn;
-                previousScoreColumn = currentScoreColumn;
-                currentScoreColumn = tempBubble;
-
-                tempBubble = previousOriginColumn;
-                previousOriginColumn = currentOriginColumn;
-                currentOriginColumn = tempBubble;
-
-                //if (i % slidingStep == 0 && columnMaxPotential )
-                //{
-                //    break;
-                //}
+                // TODO (shared-state safety): keep all pruning inputs local to this invocation.
+                // Do not read context.Threshold, context.CurrentSequenceIndex, or a mutable
+                // "best score so far" shared across Tasks here unless protected/snapshotted.
+                // Every task must prune only against its own marker/chunk and captured threshold.
+                //
+                // Potential pruning note: rowMaxScore is useful for diagnostics/experiments, but
+                // it is deliberately NOT used as the sole bound. With Smith-Waterman zero-reset,
+                // a later row may start a completely new local alignment.
+                Swap(ref previousH, ref currentH);
+                Swap(ref previousOrigin, ref currentOrigin);
+                Swap(ref previousGapInMarker, ref currentGapInMarker);
             }
 
-            if (globalMaxScore >= absoluteThreshold)
+            if (globalMaxScore >= absoluteThreshold && globalMaxScore > 0)
             {
                 return new ScoreContext(globalMaxScore, globalMaxOrigin, globalMaxEnd);
             }
-            else
-            {
-                return null;
-            }
+
+            return null;
+        }
+
+        private static void Swap<T>(ref T left, ref T right)
+        {
+            T temporary = left;
+            left = right;
+            right = temporary;
         }
     }
 }
