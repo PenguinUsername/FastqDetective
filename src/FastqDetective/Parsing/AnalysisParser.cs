@@ -287,7 +287,6 @@ namespace FastqDetective.Parsing
         /// <summary>
         /// Smith-Waterman local alignment with affine gaps and rolling arrays.
         /// Match = +2, mismatch = -1, gap-open = -2, gap-extension = -1.
-        /// The zero floor permits a local alignment to restart at any cell.
         ///
         /// Conservative upper-bound pruning stops when no continuation or new local alignment
         /// can strictly improve the first maximum already found. The legacy heuristic and
@@ -345,7 +344,7 @@ namespace FastqDetective.Parsing
                         : MismatchScore;
                     int diagonal = previousH[j - 1] + substitution;
 
-                    // Canonical Smith-Waterman local-alignment reset.
+                    // Floor at 0
                     int best = Math.Max(0, Math.Max(diagonal,
                         Math.Max(currentGapInMarker[j], gapInSequence[j])));
 
